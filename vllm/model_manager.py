@@ -65,7 +65,7 @@ class DynamicModelManager:
         
         # Translation - обычная текстовая модель
         translation_model = ModelConfig(
-            name="Qwen/Qwen2.5-32B-Instruct",
+            name="Qwen/Qwen3-30B-A3B-Instruct-2507",
             alias="translator", 
             task_type=TaskType.TRANSLATION,
             estimated_vram_gb=30.0,
