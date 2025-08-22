@@ -1,0 +1,291 @@
+# Prometheus Configuration for PDF Converter Pipeline v4.1.0 with A3B Model
+# Конфигурация мониторинга для A3B производительности и метрик
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    cluster: 'pdf-converter-a3b'
+    environment: 'production'
+
+# Rules and alerts
+rule_files:
+  - "alert_rules_a3b.yml"
+  - "recording_rules.yml"
+
+# Scrape configurations
+scrape_configs:
+  
+  # PDF Converter Core Services
+  - job_name: 'pdf-converter-services'
+    static_configs:
+      - targets: 
+          - 'document-processor:9001'
+          - 'quality-assurance:9002'
+    metrics_path: '/metrics'
+    scrape_interval: 10s
+    scrape_timeout: 10s
+    honor_labels: true
+    params:
+      format: ['prometheus']
+
+  # vLLM A3B Server Metrics
+  - job_name: 'vllm-a3b-server'
+    static_configs:
+      - targets: ['vllm-server:8000']
+    metrics_path: '/metrics'
+    scrape_interval: 5s  # Более частый сбор для A3B метрик
+    scrape_timeout: 5s
+    honor_labels: true
+    metric_relabel_configs:
+      # Добавляем лейблы для A3B модели
+      - source_labels: [__name__]
+        regex: 'vllm_.*'
+        target_label: 'model_architecture'
+        replacement: 'a3b'
+      - source_labels: [__name__]
+        regex: 'vllm_.*'
+        target_label: 'model_name'
+        replacement: 'qwen3-30b-a3b-instruct'
+
+  # Airflow Metrics
+  - job_name: 'airflow'
+    static_configs:
+      - targets: ['airflow-webserver:8080']
+    metrics_path: '/admin/metrics'
+    scrape_interval: 30s
+    scrape_timeout: 10s
+
+  # System Metrics
+  - job_name: 'node-exporter'
+    static_configs:
+      - targets: ['node-exporter:9100']
+    scrape_interval: 15s
+    
+  # PostgreSQL Metrics (if postgres_exporter is added)
+  - job_name: 'postgres'
+    static_configs:
+      - targets: ['postgres-exporter:9187']
+    scrape_interval: 30s
+    honor_labels: true
+
+  # Redis Metrics (if redis_exporter is added)
+  - job_name: 'redis'
+    static_configs:
+      - targets: ['redis-exporter:9121']
+    scrape_interval: 30s
+
+  # Docker Container Metrics
+  - job_name: 'cadvisor'
+    static_configs:
+      - targets: ['cadvisor:8080']
+    scrape_interval: 15s
+    
+  # NVIDIA GPU Metrics (if nvidia_exporter is available)
+  - job_name: 'nvidia-gpu'
+    static_configs:
+      - targets: ['localhost:9445']
+    scrape_interval: 10s
+    honor_labels: true
+    metric_relabel_configs:
+      - source_labels: [__name__]
+        regex: 'nvidia_.*'
+        target_label: 'gpu_type'
+        replacement: 'a6000'
+
+  # Custom Application Metrics
+  - job_name: 'pdf-converter-custom'
+    static_configs:
+      - targets: ['document-processor:8001', 'quality-assurance:8002']
+    metrics_path: '/api/metrics'
+    scrape_interval: 20s
+    params:
+      format: ['json']
+    metric_relabel_configs:
+      # Rename custom metrics for consistency
+      - source_labels: [__name__]
+        regex: 'pdf_converter_(.+)'
+        target_label: '__name__'
+        replacement: 'pdfconv_${1}'
+
+# Alerting configuration
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ['alertmanager:9093']
+      timeout: 10s
+      api_version: v2
+
+# Remote write configuration (optional, for long-term storage)
+remote_write:
+  - url: "http://prometheus-remote-storage:9201/write"
+    queue_config:
+      max_samples_per_send: 1000
+      max_shards: 200
+      capacity: 2500
+
+# =====================================================================================
+# A3B SPECIFIC METRIC COLLECTION RULES
+# =====================================================================================
+
+# Recording rules for A3B performance analysis
+recording_rules:
+  - name: "a3b_performance_rules"
+    interval: 30s
+    rules:
+      # A3B Token Processing Rate
+      - record: "a3b:token_rate:rate5m"
+        expr: "rate(vllm_request_success_total[5m]) * on() group_left() vllm_avg_generation_tokens"
+        labels:
+          model: "qwen3-a3b"
+      
+      # A3B Request Latency Percentiles
+      - record: "a3b:request_latency:p95"
+        expr: "histogram_quantile(0.95, rate(vllm_request_duration_seconds_bucket[5m]))"
+        labels:
+          model: "qwen3-a3b"
+      
+      # A3B GPU Utilization Average
+      - record: "a3b:gpu_utilization:avg"
+        expr: "avg(nvidia_gpu_utilization_percent) by (instance)"
+        labels:
+          model: "qwen3-a3b"
+      
+      # A3B Memory Usage
+      - record: "a3b:gpu_memory:usage_percent"
+        expr: "(nvidia_gpu_memory_used_bytes / nvidia_gpu_memory_total_bytes) * 100"
+        labels:
+          model: "qwen3-a3b"
+
+  - name: "pipeline_performance_rules"
+    interval: 60s
+    rules:
+      # Document Processing Rate
+      - record: "pipeline:documents:processed_per_hour"
+        expr: "rate(pdf_converter_documents_processed_total[1h]) * 3600"
+      
+      # Translation Success Rate
+      - record: "pipeline:translation:success_rate"
+        expr: "rate(pdf_converter_translations_success_total[5m]) / rate(pdf_converter_translations_total[5m])"
+      
+      # QA Pass Rate
+      - record: "pipeline:qa:pass_rate"
+        expr: "rate(pdf_converter_qa_passed_total[5m]) / rate(pdf_converter_qa_total[5m])"
+      
+      # Average Processing Time
+      - record: "pipeline:processing:avg_duration"
+        expr: "rate(pdf_converter_processing_duration_seconds_sum[5m]) / rate(pdf_converter_processing_duration_seconds_count[5m])"
+
+# =====================================================================================
+# FEDERATION AND SERVICE DISCOVERY
+# =====================================================================================
+
+# Service discovery for dynamic targets
+kubernetes_sd_configs:
+  - role: pod
+    namespaces:
+      names:
+        - pdf-converter
+    selectors:
+      - role: "pod"
+        label: "app=pdf-converter"
+
+# File-based service discovery for additional targets
+file_sd_configs:
+  - files:
+    - "/etc/prometheus/targets/*.yml"
+    refresh_interval: 30s
+
+# =====================================================================================
+# STORAGE AND RETENTION
+# =====================================================================================
+
+# Storage configuration
+storage:
+  tsdb:
+    path: "/prometheus"
+    retention.time: "15d"
+    retention.size: "50GB"
+    wal-compression: true
+
+# =====================================================================================
+# WEB CONFIGURATION
+# =====================================================================================
+
+web:
+  console.libraries: "/etc/prometheus/console_libraries"
+  console.templates: "/etc/prometheus/consoles"
+  enable-lifecycle: true
+  enable-admin-api: true
+
+# =====================================================================================
+# LOGGING
+# =====================================================================================
+
+log:
+  level: "info"
+  format: "json"
+
+# =====================================================================================
+# FEATURE FLAGS
+# =====================================================================================
+
+feature_flags:
+  - "promql-at-modifier"
+  - "promql-negative-offset"
+
+# =====================================================================================
+# EXEMPLARS (for detailed tracing)
+# =====================================================================================
+
+exemplar_storage:
+  max_exemplars: 100000
+
+# =====================================================================================
+# ADDITIONAL A3B MONITORING TARGETS
+# =====================================================================================
+
+# Additional scrape jobs for detailed A3B monitoring
+additional_scrape_configs:
+  # A3B Model Health Check
+  - job_name: 'a3b-health'
+    static_configs:
+      - targets: ['vllm-server:8000']
+    metrics_path: '/health'
+    scrape_interval: 30s
+    scrape_timeout: 5s
+    params:
+      format: ['prometheus']
+    metric_relabel_configs:
+      - source_labels: [__name__]
+        target_label: 'service'
+        replacement: 'vllm-a3b'
+
+  # A3B Model Info
+  - job_name: 'a3b-model-info'
+    static_configs:
+      - targets: ['vllm-server:8000']
+    metrics_path: '/v1/models'
+    scrape_interval: 300s  # Every 5 minutes
+    scrape_timeout: 10s
+    metric_relabel_configs:
+      - source_labels: [__name__]
+        regex: 'model_.*'
+        target_label: 'model_type'
+        replacement: 'a3b'
+
+# =====================================================================================
+# PERFORMANCE OPTIMIZATION
+# =====================================================================================
+
+# Query optimization
+query:
+  max_concurrency: 20
+  max_samples: 50000000
+  timeout: 2m
+
+# Scrape optimization
+scrape_configs_optimization:
+  honor_labels: true
+  honor_timestamps: true
+  track_timestamps_staleness: true
